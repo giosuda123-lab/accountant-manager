@@ -71,7 +71,9 @@ bot.command('tasks', async (ctx) => {
     .eq('telegram_chat_id', chatId)
     .single();
 
-  console.log('DEBUG /tasks - chatId:', chatId, 'user:', user, 'error:', userError);
+  console.log('DEBUG chatId:', JSON.stringify(chatId));
+  console.log('DEBUG user:', JSON.stringify(user));
+  console.log('DEBUG error:', JSON.stringify(userError));
 
   if (!user) {
     return ctx.reply('თქვენ ჯერ არ ხართ დარეგისტრირებული სისტემაში. მიმართეთ ადმინისტრატორს.');
