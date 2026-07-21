@@ -65,11 +65,13 @@ bot.start((ctx) => {
 bot.command('tasks', async (ctx) => {
   const chatId = String(ctx.chat.id);
 
-  const { data: user } = await supabase
+  const { data: user, error: userError } = await supabase
     .from('users')
     .select('id, full_name')
     .eq('telegram_chat_id', chatId)
     .single();
+
+  console.log('DEBUG /tasks - chatId:', chatId, 'user:', user, 'error:', userError);
 
   if (!user) {
     return ctx.reply('თქვენ ჯერ არ ხართ დარეგისტრირებული სისტემაში. მიმართეთ ადმინისტრატორს.');
