@@ -893,7 +893,7 @@ async function sendReminders() {
 
   const { data: logs, error } = await supabase
     .from('task_logs')
-    .select('id, remind_time, tasks(title, assigned_to, companies(name), users:assigned_to(telegram_chat_id))')
+    .select('id, remind_time, tasks(title, assigned_to, companies(name))')
     .eq('scheduled_date', todayDate)
     .eq('status', 'pending')
     .is('reminder_sent_at', null);
@@ -903,26 +903,41 @@ async function sendReminders() {
     return;
   }
 
+  const { data: allUsers } = await supabase
+    .from('users')
+    .select('id, telegram_chat_id')
+    .not('telegram_chat_id', 'is', null);
+
   for (const log of logs || []) {
     if (!isInCurrentReminderWindow(log.remind_time)) continue;
-
-    const chatId = log.tasks?.users?.telegram_chat_id;
-    if (!chatId) continue;
 
     const companyName = log.tasks?.companies?.name || 'უცნობი კომპანია';
     const title = log.tasks?.title || '';
 
-    try {
-      await bot.telegram.sendMessage(
-        chatId,
-        `🔔 შეხსენება!\n\n🏢 ${companyName}\n📋 ${title}`,
-        Markup.inlineKeyboard([Markup.button.callback('✅ დასრულებულია', `done_${log.id}`)])
-      );
-
-      await supabase.from('task_logs').update({ reminder_sent_at: new Date().toISOString() }).eq('id', log.id);
-    } catch (e) {
-      console.error(`ვერ გაიგზავნა შეტყობინება chat_id ${chatId}-ზე:`, e.message);
+    // თუ დავალებას კონკრეტული პასუხისმგებელი ჰყავს მინიჭებული — მხოლოდ მას ეგზავნება.
+    // წინააღმდეგ შემთხვევაში, ეგზავნება ყველა რეგისტრირებულ მომხმარებელს.
+    let targetChatIds = [];
+    if (log.tasks?.assigned_to) {
+      const assignedUser = (allUsers || []).find((u) => u.id === log.tasks.assigned_to);
+      if (assignedUser?.telegram_chat_id) targetChatIds = [assignedUser.telegram_chat_id];
     }
+    if (targetChatIds.length === 0) {
+      targetChatIds = (allUsers || []).map((u) => u.telegram_chat_id);
+    }
+
+    for (const chatId of targetChatIds) {
+      try {
+        await bot.telegram.sendMessage(
+          chatId,
+          `🔔 შეხსენება!\n\n🏢 ${companyName}\n📋 ${title}`,
+          Markup.inlineKeyboard([Markup.button.callback('✅ დასრულებულია', `done_${log.id}`)])
+        );
+      } catch (e) {
+        console.error(`ვერ გაიგზავნა შეტყობინება chat_id ${chatId}-ზე:`, e.message);
+      }
+    }
+
+    await supabase.from('task_logs').update({ reminder_sent_at: new Date().toISOString() }).eq('id', log.id);
   }
 }
 
