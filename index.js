@@ -20,6 +20,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const awaitingState = {};
 
+// ---------- დამხმარე ფუნქციები ----------
+
 function todayStr() {
   return new Date().toLocaleDateString('en-CA', { timeZone: TIMEZONE });
 }
@@ -47,13 +49,14 @@ function matchesRecurrence(rule, date) {
 }
 
 function isValidRecurrenceRule(rule) {
+  if (!rule || typeof rule !== 'string') return false;
   return /^monthly_day_([1-9]|[12][0-9]|3[01])$/.test(rule) ||
     /^weekly_(monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/.test(rule) ||
     /^yearly_(1[0-2]|[1-9])_([1-9]|[12][0-9]|3[01])$/.test(rule);
 }
 
 function isValidDate(str) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(str) && !isNaN(new Date(str).getTime());
+  return typeof str === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(str) && !isNaN(new Date(str).getTime());
 }
 
 async function getUserByChatId(chatId) {
@@ -80,21 +83,176 @@ function findCompanyByName(companies, name) {
   );
 }
 
-async function interpretMessageWithAI(text, companies) {
+function formatScheduleResults(rows) {
+  if (rows.length === 0) return 'ვერაფერი მოიძებნა მითითებული პირობებით. 🎉';
+
+  const byDate = {};
+  for (const r of rows) {
+    if (!byDate[r.scheduled_date]) byDate[r.scheduled_date] = [];
+    byDate[r.scheduled_date].push(r);
+  }
+
+  const dates = Object.keys(byDate).sort();
+  let text = '';
+  for (const d of dates) {
+    text += `📅 ${d}\n`;
+    for (const r of byDate[d]) {
+      const icon = r.status === 'done' ? '✅' : '🔲';
+      text += `${icon} ${r.companyName} — ${r.title}\n`;
+    }
+    text += '\n';
+  }
+  return text.trim();
+}
+
+async function queryScheduleFromDB({ company_name, date_from, date_to, status_filter }) {
+  let query = supabase
+    .from('task_logs')
+    .select('scheduled_date, status, tasks(title, companies(name))')
+    .order('scheduled_date', { ascending: true });
+
+  if (isValidDate(date_from)) query = query.gte('scheduled_date', date_from);
+  if (isValidDate(date_to)) query = query.lte('scheduled_date', date_to);
+  if (status_filter && status_filter !== 'all') query = query.eq('status', status_filter);
+
+  const { data, error } = await query;
+  if (error) {
+    console.error('queryScheduleFromDB error:', error);
+    return [];
+  }
+
+  let rows = (data || [])
+    .filter((r) => r.tasks)
+    .map((r) => ({
+      scheduled_date: r.scheduled_date,
+      status: r.status,
+      title: r.tasks.title,
+      companyName: r.tasks.companies?.name || 'უცნობი კომპანია',
+    }));
+
+  if (company_name) {
+    const lower = company_name.toLowerCase();
+    rows = rows.filter(
+      (r) => r.companyName.toLowerCase().includes(lower) || lower.includes(r.companyName.toLowerCase())
+    );
+  }
+
+  return rows;
+}
+
+async function findMatchingTaskLog({ company_name, task_keyword, date }) {
+  const targetDate = isValidDate(date) ? date : todayStr();
+
+  const { data, error } = await supabase
+    .from('task_logs')
+    .select('id, status, tasks(title, companies(name))')
+    .eq('scheduled_date', targetDate)
+    .neq('status', 'done');
+
+  if (error) {
+    console.error('findMatchingTaskLog error:', error);
+    return [];
+  }
+
+  let rows = (data || [])
+    .filter((r) => r.tasks)
+    .map((r) => ({
+      logId: r.id,
+      title: r.tasks.title,
+      companyName: r.tasks.companies?.name || 'უცნობი კომპანია',
+    }));
+
+  if (company_name) {
+    const lower = company_name.toLowerCase();
+    rows = rows.filter(
+      (r) => r.companyName.toLowerCase().includes(lower) || lower.includes(r.companyName.toLowerCase())
+    );
+  }
+
+  if (task_keyword) {
+    const lower = task_keyword.toLowerCase();
+    rows = rows.filter((r) => r.title.toLowerCase().includes(lower));
+  }
+
+  return rows;
+}
+
+// ---------- AI (Claude API) — მრავალფუნქციური ინტერპრეტაცია ----------
+
+const AI_TOOLS = [
+  {
+    name: 'query_schedule',
+    description: 'გამოიყენე, როცა მომხმარებელი კითხულობს რა დავალებები აქვს, რომელ თარიღზე, ან რომელი კომპანიისთვის — ანუ მხოლოდ ინფორმაციის მოძიება, არაფრის შეცვლა.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_name: { type: 'string', description: 'თუ კონკრეტული კომპანიაა ნახსენები, სახელი. სხვა შემთხვევაში ცარიელი სტრიქონი.' },
+        date_from: { type: 'string', description: 'YYYY-MM-DD ფორმატში. გამოთვალე კონკრეტული თარიღი მოთხოვნის მიხედვით.' },
+        date_to: { type: 'string', description: 'YYYY-MM-DD ფორმატში.' },
+        status_filter: { type: 'string', enum: ['pending', 'done', 'all'] },
+      },
+      required: ['company_name', 'date_from', 'date_to', 'status_filter'],
+    },
+  },
+  {
+    name: 'add_task',
+    description: 'გამოიყენე ახალი დავალების ან შემახსენებლის დასამატებლად არსებული კომპანიისთვის.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_name: { type: 'string' },
+        task_title: { type: 'string' },
+        due_date: { type: 'string', description: 'YYYY-MM-DD ერთჯერადი დავალებისთვის, ან ცარიელი სტრიქონი თუ განმეორებადია.' },
+        recurrence_rule: { type: 'string', description: 'monthly_day_N / weekly_დღე(ინგლისურად) / yearly_M_D, ან ცარიელი სტრიქონი თუ ერთჯერადია.' },
+      },
+      required: ['company_name', 'task_title', 'due_date', 'recurrence_rule'],
+    },
+  },
+  {
+    name: 'add_company',
+    description: 'გამოიყენე ახალი კომპანიის დასამატებლად.',
+    input_schema: {
+      type: 'object',
+      properties: { company_name: { type: 'string' } },
+      required: ['company_name'],
+    },
+  },
+  {
+    name: 'delete_company',
+    description: 'გამოიყენე არსებული კომპანიის წასაშლელად.',
+    input_schema: {
+      type: 'object',
+      properties: { company_name: { type: 'string' } },
+      required: ['company_name'],
+    },
+  },
+  {
+    name: 'mark_task_done',
+    description: 'გამოიყენე, როცა მომხმარებელი ამბობს რომ უკვე შეასრულა კონკრეტული დავალება (მაგ. "დავამთავრე X-ის დღგ").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_name: { type: 'string' },
+        task_keyword: { type: 'string', description: 'დავალების დასახელების საკვანძო სიტყვა.' },
+        date: { type: 'string', description: 'YYYY-MM-DD, ჩვეულებრივ დღევანდელი, თუ სხვა არ არის ნახსენები.' },
+        note: { type: 'string', description: 'მოკლე კომენტარი, თუ მომხმარებელმა დაწერა რა გააკეთა.' },
+      },
+      required: ['company_name', 'task_keyword', 'date', 'note'],
+    },
+  },
+];
+
+async function runAIAgent(text, companies) {
   const companyList = companies.map((c) => c.name).join(', ') || '(ჯერ არცერთი კომპანია არ არის)';
   const today = todayStr();
 
   const systemPrompt =
-    `შენ ეხმარები ბუღალტრის ასისტენტ ბოტს ქართული ტექსტის ინტერპრეტაციაში. ` +
-    `დღევანდელი თარიღია ${today} (${TIMEZONE}). ` +
+    `შენ ხარ ბუღალტრის ასისტენტ ბოტის შიდა ლოგიკა. დღევანდელი თარიღია ${today} (${TIMEZONE}). ` +
     `არსებული აქტიური კომპანიები: ${companyList}. ` +
-    `მომხმარებლის შეტყობინება შეიძლება ითხოვდეს ახალი დავალების დამატებას არსებული კომპანიისთვის, ` +
-    `ან ახალი კომპანიის დამატებას. თუ თარიღი კონკრეტულად არ არის ნახსენები მაგრამ ცხადია რომ ერთჯერადია, ` +
-    `გამოიყენე დღევანდელი თარიღი. თუ მეორდება (ყოველთვის/ყოველკვირეულად/ყოველწლიურად), გამოიყენე შესაბამისი წესი: ` +
-    `monthly_day_N, weekly_DAYNAME (ინგლისურად, მაგ weekly_monday), ან yearly_M_D. ` +
-    `თუ შეტყობინება არ ითხოვს არცერთს ამათგანს, დააბრუნე action: "none". ` +
-    `მნიშვნელოვანია: თუ ველი არ გამოიყენება (მაგ. თარიღი ან წესი არ არის ნახსენები), დააბრუნე ცარიელი სტრიქონი "" — ` +
-    `არასდროს დაწერო სიტყვა "none" ან სხვა placeholder ტექსტი ამ ველებში.`;
+    `მომხმარებელი წერს ქართულად თავისუფალ ტექსტს. გამოიყენე შესაბამისი tool, თუ მოთხოვნა ერთ-ერთს ემთხვევა. ` +
+    `თუ უბრალოდ ესაუბრება ან კითხვა არაფერს ეხება ამ სისტემიდან, უპასუხე ჩვეულებრივი ტექსტით, tool-ის გარეშე. ` +
+    `თარიღები აუცილებლად გამოთვალე კონკრეტულ YYYY-MM-DD ფორმატში დღევანდელი თარიღიდან გამომდინარე (მაგ. "ხვალ", "15 რიცხვში" და ა.შ. ). ` +
+    `არასდროს დაწერო სიტყვა "none" ან სხვა placeholder — გამოუყენებელი ველისთვის ყოველთვის ცარიელი სტრიქონი "" გამოიყენე.`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -105,34 +263,19 @@ async function interpretMessageWithAI(text, companies) {
     },
     body: JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 400,
+      max_tokens: 500,
       system: systemPrompt,
       messages: [{ role: 'user', content: text }],
-      tools: [
-        {
-          name: 'task_action',
-          description: 'დაადგინე, რომელი მოქმედება სურს მომხმარებელს.',
-          input_schema: {
-            type: 'object',
-            properties: {
-              action: { type: 'string', enum: ['add_task', 'add_company', 'none'] },
-              company_name: { type: 'string' },
-              task_title: { type: 'string' },
-              due_date: { type: 'string', description: 'YYYY-MM-DD ან ცარიელი სტრიქონი' },
-              recurrence_rule: { type: 'string', description: 'monthly_day_N / weekly_დღე / yearly_M_D ან ცარიელი' },
-            },
-            required: ['action', 'company_name', 'task_title', 'due_date', 'recurrence_rule'],
-          },
-        },
-      ],
-      tool_choice: { type: 'tool', name: 'task_action' },
+      tools: AI_TOOLS,
+      tool_choice: { type: 'auto' },
     }),
   });
 
   const data = await response.json();
-  const toolUse = data.content?.find((block) => block.type === 'tool_use');
-  return toolUse ? toolUse.input : { action: 'none' };
+  return data;
 }
+
+// ---------- ძირითადი ბრძანებები ----------
 
 bot.start((ctx) => {
   ctx.reply(
@@ -149,7 +292,8 @@ bot.command('help', (ctx) => {
     '/deletecompany — კომპანიის წაშლა\n' +
     '/addtask — ახალი დავალების დამატება (ეტაპობრივად)\n\n' +
     (ANTHROPIC_API_KEY
-      ? 'ასევე შეგიძლიათ უბრალოდ ჩაწეროთ თხოვნა ჩვეულებრივი ტექსტით, მაგ:\n"დამიმატე ახალი დავალება შპს მზერასთვის 15 რიცხვში"'
+      ? 'ასევე შეგიძლიათ უბრალოდ დაწეროთ ჩვეულებრივი ტექსტი, მაგ:\n' +
+        '"რა მაქვს 15 რიცხვში?"\n"დამიმატე დავალება X კომპანიისთვის ხვალ"\n"დავამთავრე Y-ის დღგ"'
       : '')
   );
 });
@@ -191,6 +335,8 @@ bot.command('tasks', async (ctx) => {
   }
 });
 
+// ---------- კომპანიის დამატება (ბრძანებით) ----------
+
 bot.command('addcompany', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = await getUserByChatId(chatId);
@@ -211,6 +357,8 @@ bot.command('addcompany', async (ctx) => {
 
   ctx.reply(`✅ კომპანია "${name}" დაემატა.`);
 });
+
+// ---------- კომპანიის წაშლა (ბრძანებით) ----------
 
 bot.command('deletecompany', async (ctx) => {
   const chatId = String(ctx.chat.id);
@@ -255,6 +403,8 @@ bot.action('delcompany_cancel', async (ctx) => {
   await ctx.editMessageText('გაუქმდა.');
 });
 
+// ---------- დავალების დამატება (ეტაპობრივი დიალოგი, ბრძანებით) ----------
+
 bot.command('addtask', async (ctx) => {
   const chatId = String(ctx.chat.id);
   const user = await getUserByChatId(chatId);
@@ -280,6 +430,8 @@ bot.action(/addtask_company_(.+)/, async (ctx) => {
   await ctx.reply('დაწერეთ დავალების დასახელება:');
 });
 
+// ---------- AI-ის მიერ შემოთავაზებული მოქმედების დადასტურება ----------
+
 bot.action('ai_confirm_yes', async (ctx) => {
   const chatId = ctx.chat.id;
   const pending = awaitingState[chatId];
@@ -291,11 +443,31 @@ bot.action('ai_confirm_yes', async (ctx) => {
   }
 
   const { action } = pending;
+  delete awaitingState[chatId];
 
   if (action.kind === 'add_company') {
     await supabase.from('companies').insert({ name: action.company_name });
-    delete awaitingState[chatId];
     return ctx.editMessageText(`✅ კომპანია "${action.company_name}" დაემატა.`);
+  }
+
+  if (action.kind === 'delete_company') {
+    await supabase.from('companies').update({ is_active: false }).eq('id', action.companyId);
+    await supabase.from('tasks').update({ is_archived: true }).eq('company_id', action.companyId);
+    return ctx.editMessageText(`🗑 კომპანია "${action.companyName}" წაშლილია.`);
+  }
+
+  if (action.kind === 'mark_task_done') {
+    const user = await getUserByChatId(chatId);
+    await supabase
+      .from('task_logs')
+      .update({
+        status: 'done',
+        completed_at: new Date().toISOString(),
+        completed_by: user?.id || null,
+        completion_note: action.note || null,
+      })
+      .eq('id', action.logId);
+    return ctx.editMessageText('✅ მონიშნულია, როგორც დასრულებული!');
   }
 
   if (action.kind === 'add_task') {
@@ -311,7 +483,6 @@ bot.action('ai_confirm_yes', async (ctx) => {
 
     if (error || !task) {
       console.error(error);
-      delete awaitingState[chatId];
       return ctx.editMessageText('შეცდომა დავალების დამატებისას.');
     }
 
@@ -323,7 +494,6 @@ bot.action('ai_confirm_yes', async (ctx) => {
       });
     }
 
-    delete awaitingState[chatId];
     return ctx.editMessageText(`✅ დავალება "${action.task_title}" დაემატა.`);
   }
 });
@@ -345,10 +515,13 @@ bot.action(/done_(.+)/, async (ctx) => {
   await ctx.reply('დაწერეთ მოკლე კომენტარი, რა გააკეთეთ (ან გამოაგზავნეთ "-" თუ კომენტარი არ გინდათ):');
 });
 
+// ---------- ტექსტური შეტყობინებების დამუშავება ----------
+
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
   const state = awaitingState[chatId];
 
+  // --- დასრულების კომენტარის ლოდინი (/tasks-დან ღილაკი) ---
   if (state?.type === 'note') {
     const note = ctx.message.text === '-' ? null : ctx.message.text;
     const user = await getUserByChatId(chatId);
@@ -367,6 +540,7 @@ bot.on('text', async (ctx) => {
     return ctx.reply('✅ მონიშნულია, როგორც დასრულებული. კარგი საქმეა!');
   }
 
+  // --- ახალი დავალების სახელის ლოდინი (/addtask ეტაპობრივი დიალოგი) ---
   if (state?.type === 'addtask_title') {
     awaitingState[chatId] = { type: 'addtask_schedule', companyId: state.companyId, title: ctx.message.text };
     return ctx.reply(
@@ -411,6 +585,7 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`✅ დავალება "${title}" დაემატა.`);
   }
 
+  // --- არცერთი აქტიური დიალოგი: ვცადოთ AI აგენტით გაგება ---
   if (!ANTHROPIC_API_KEY) return;
 
   const user = await getUserByChatId(chatId);
@@ -418,12 +593,28 @@ bot.on('text', async (ctx) => {
 
   try {
     const companies = await getActiveCompanies();
-    const parsed = await interpretMessageWithAI(ctx.message.text, companies);
+    const aiResponse = await runAIAgent(ctx.message.text, companies);
+    const toolUse = aiResponse.content?.find((b) => b.type === 'tool_use');
+    const textBlock = aiResponse.content?.find((b) => b.type === 'text');
 
-    if (parsed.action === 'add_company' && parsed.company_name) {
-      awaitingState[chatId] = { type: 'ai_confirm', action: { kind: 'add_company', company_name: parsed.company_name } };
+    if (!toolUse) {
+      if (textBlock?.text) await ctx.reply(textBlock.text);
+      return;
+    }
+
+    const input = toolUse.input;
+
+    // --- ინფორმაციის მოძიება (დადასტურება არ სჭირდება) ---
+    if (toolUse.name === 'query_schedule') {
+      const rows = await queryScheduleFromDB(input);
+      return ctx.reply(formatScheduleResults(rows));
+    }
+
+    // --- ახალი კომპანია ---
+    if (toolUse.name === 'add_company' && input.company_name) {
+      awaitingState[chatId] = { type: 'ai_confirm', action: { kind: 'add_company', company_name: input.company_name } };
       return ctx.reply(
-        `🤖 გავიგე, რომ გსურთ ახალი კომპანიის დამატება:\n\n🏢 ${parsed.company_name}\n\nდავამატო?`,
+        `🤖 გავიგე, რომ გსურთ ახალი კომპანიის დამატება:\n\n🏢 ${input.company_name}\n\nდავამატო?`,
         Markup.inlineKeyboard([
           Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
           Markup.button.callback('❌ არა', 'ai_confirm_no'),
@@ -431,32 +622,79 @@ bot.on('text', async (ctx) => {
       );
     }
 
-    if (parsed.action === 'add_task' && parsed.task_title) {
-      const company = findCompanyByName(companies, parsed.company_name);
+    // --- კომპანიის წაშლა ---
+    if (toolUse.name === 'delete_company' && input.company_name) {
+      const company = findCompanyByName(companies, input.company_name);
+      if (!company) {
+        return ctx.reply(`🤖 ვერ ვიპოვე კომპანია "${input.company_name}".`);
+      }
+      awaitingState[chatId] = {
+        type: 'ai_confirm',
+        action: { kind: 'delete_company', companyId: company.id, companyName: company.name },
+      };
+      return ctx.reply(
+        `🤖 დარწმუნებული ხართ, რომ გსურთ წაშალოთ "${company.name}"? ეს დამალავს კომპანიას და მის ყველა დავალებას.`,
+        Markup.inlineKeyboard([
+          Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
+          Markup.button.callback('❌ არა', 'ai_confirm_no'),
+        ])
+      );
+    }
+
+    // --- დავალების დასრულებულად მონიშვნა ---
+    if (toolUse.name === 'mark_task_done') {
+      const matches = await findMatchingTaskLog(input);
+
+      if (matches.length === 0) {
+        return ctx.reply('🤖 ვერ ვიპოვე შესაბამისი აქტიური დავალება.');
+      }
+      if (matches.length > 1) {
+        const list = matches.map((m) => `• ${m.companyName} — ${m.title}`).join('\n');
+        return ctx.reply(`🤖 რამდენიმე დავალება ემთხვევა, დააკონკრეტეთ რომელი:\n\n${list}`);
+      }
+
+      const match = matches[0];
+      awaitingState[chatId] = {
+        type: 'ai_confirm',
+        action: { kind: 'mark_task_done', logId: match.logId, note: input.note || null },
+      };
+      return ctx.reply(
+        `🤖 ვიპოვე დავალება:\n\n🏢 ${match.companyName}\n📋 ${match.title}\n\nდავასრულო?`,
+        Markup.inlineKeyboard([
+          Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
+          Markup.button.callback('❌ არა', 'ai_confirm_no'),
+        ])
+      );
+    }
+
+    // --- ახალი დავალება ---
+    if (toolUse.name === 'add_task' && input.task_title) {
+      const company = findCompanyByName(companies, input.company_name);
 
       if (!company) {
         return ctx.reply(
-          `🤖 ვერ ვიპოვე კომპანია "${parsed.company_name || 'უცნობი'}". ჯერ დაამატეთ /addcompany-თი, ან დააკონკრეტეთ სახელი.`
+          `🤖 ვერ ვიპოვე კომპანია "${input.company_name || 'უცნობი'}". ჯერ დაამატეთ /addcompany-თი, ან დააკონკრეტეთ სახელი.`
         );
       }
 
-      const scheduleText = parsed.recurrence_rule
-        ? `განმეორებადი (${parsed.recurrence_rule})`
-        : parsed.due_date || todayStr();
+      const cleanRule = isValidRecurrenceRule(input.recurrence_rule) ? input.recurrence_rule : null;
+      const dueDate = cleanRule ? null : (isValidDate(input.due_date) ? input.due_date : todayStr());
+
+      const scheduleText = cleanRule ? `განმეორებადი (${cleanRule})` : dueDate;
 
       awaitingState[chatId] = {
         type: 'ai_confirm',
         action: {
           kind: 'add_task',
           companyId: company.id,
-          task_title: parsed.task_title,
-          due_date: parsed.due_date || todayStr(),
-          recurrence_rule: parsed.recurrence_rule || null,
+          task_title: input.task_title,
+          due_date: dueDate,
+          recurrence_rule: cleanRule,
         },
       };
 
       return ctx.reply(
-        `🤖 გავიგე, რომ გსურთ დავალების დამატება:\n\n🏢 ${company.name}\n📋 ${parsed.task_title}\n📅 ${scheduleText}\n\nდავამატო?`,
+        `🤖 გავიგე, რომ გსურთ დავალების დამატება:\n\n🏢 ${company.name}\n📋 ${input.task_title}\n📅 ${scheduleText}\n\nდავამატო?`,
         Markup.inlineKeyboard([
           Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
           Markup.button.callback('❌ არა', 'ai_confirm_no'),
@@ -464,9 +702,11 @@ bot.on('text', async (ctx) => {
       );
     }
   } catch (e) {
-    console.error('AI interpretation error:', e.message);
+    console.error('AI agent error:', e.message);
   }
 });
+
+// ---------- ავტომატური ფონური სამუშაოები ----------
 
 async function generateRecurringLogs() {
   const today = new Date();
@@ -550,6 +790,7 @@ cron.schedule(
   { timezone: TIMEZONE }
 );
 
+// ---------- გაშვება ----------
 bot.launch().then(() => console.log('ბოტი გაეშვა წარმატებით.'));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
