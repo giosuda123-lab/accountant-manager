@@ -59,6 +59,35 @@ function isValidDate(str) {
   return typeof str === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(str) && !isNaN(new Date(str).getTime());
 }
 
+function isValidTime(str) {
+  return typeof str === 'string' && /^([01]\d|2[0-3]):([0-5]\d)$/.test(str);
+}
+
+function getCurrentMinutesOfDay() {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TIMEZONE,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+  const hour = parseInt(parts.find((p) => p.type === 'hour').value, 10);
+  const minute = parseInt(parts.find((p) => p.type === 'minute').value, 10);
+  return hour * 60 + minute;
+}
+
+function timeStrToMinutes(t) {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function isInCurrentReminderWindow(remindTime) {
+  // ცარიელი/undefined remind_time ნიშნავს ნაგულისხმევ 08:00-ს
+  const target = timeStrToMinutes(remindTime || '08:00');
+  const currentBucket = Math.floor(getCurrentMinutesOfDay() / 5) * 5;
+  const targetBucket = Math.floor(target / 5) * 5;
+  return targetBucket === currentBucket;
+}
+
 async function getUserByChatId(chatId) {
   const { data } = await supabase
     .from('users')
@@ -204,8 +233,9 @@ const AI_TOOLS = [
         task_title: { type: 'string' },
         due_date: { type: 'string', description: 'YYYY-MM-DD ერთჯერადი დავალებისთვის, ან ცარიელი სტრიქონი თუ განმეორებადია.' },
         recurrence_rule: { type: 'string', description: 'monthly_day_N / weekly_დღე(ინგლისურად) / yearly_M_D, ან ცარიელი სტრიქონი თუ ერთჯერადია.' },
+        remind_time: { type: 'string', description: 'HH:MM ფორმატში (24-საათიანი), თუ კონკრეტული საათი იყო ნახსენები. სხვა შემთხვევაში ცარიელი სტრიქონი.' },
       },
-      required: ['company_name', 'task_title', 'due_date', 'recurrence_rule'],
+      required: ['company_name', 'task_title', 'due_date', 'recurrence_rule', 'remind_time'],
     },
   },
   {
@@ -258,9 +288,9 @@ async function runAIAgent(text, companies) {
     `არ იკითხო დამაზუსტებელი კითხვა, თუ ინფორმაცია გონივრულად ამოსაცნობია კონტექსტიდან. ` +
     `დამაზუსტებელი კითხვა დასვი მხოლოდ იმ შემთხვევაში, თუ ნამდვილად ორაზროვანია რომელი კომპანია იგულისხმება ` +
     `(მაგ. სახელი საერთოდ არ ემთხვევა არცერთ არსებულ კომპანიას). ` +
-    `მნიშვნელოვანი შეზღუდვა: სისტემას შეუძლია მხოლოდ თარიღების დამახსოვრება (არა კონკრეტული საათის) — ` +
-    `შემახსენებლები იგზავნება ყოველდღე დილის 8 საათზე ერთხელ. თუ მომხმარებელი კონკრეტულ საათს ახსენებს, ` +
-    `თავაზიანად აუხსენი ეს შეზღუდვა და შესთავაზე თარიღით დამახსოვრება. ` +
+    `მნიშვნელოვანი: სისტემას შეუძლია კონკრეტულ საათზეც შემახსენოს (remind_time ველით, HH:MM ფორმატში, 24-საათიანი). ` +
+    `თუ მომხმარებელმა კონკრეტული საათი ახსენა (მაგ. "14:30-ზე"), ჩაწერე ის remind_time ველში. ` +
+    `თუ საათი არ არის ნახსენები, დატოვე remind_time ცარიელი — მაშინ შემახსენებელი ავტომატურად გაიგზავნება დილის 8 საათზე. ` +
     `თარიღები აუცილებლად გამოთვალე კონკრეტულ YYYY-MM-DD ფორმატში დღევანდელი თარიღიდან გამომდინარე (მაგ. "ხვალ", "15 რიცხვში" და ა.შ.). ` +
     `არასდროს დაწერო სიტყვა "none" ან სხვა placeholder — გამოუყენებელი ველისთვის ყოველთვის ცარიელი სტრიქონი "" გამოიყენე. ` +
     `როცა ჩვეულებრივ ტექსტს პასუხობ (tool-ის გარეშე), დაწერე ბუნებრივი, გამართული, თანამედროვე ქართულით — ` +
@@ -489,6 +519,7 @@ bot.action('ai_confirm_yes', async (ctx) => {
       is_recurring: !!action.recurrence_rule,
       recurrence_rule: action.recurrence_rule || null,
       due_date: action.recurrence_rule ? null : action.due_date,
+      remind_time: action.remind_time || null,
     };
 
     const { data: task, error } = await supabase.from('tasks').insert(taskData).select().single();
@@ -503,6 +534,7 @@ bot.action('ai_confirm_yes', async (ctx) => {
         task_id: task.id,
         scheduled_date: taskData.due_date,
         status: 'pending',
+        remind_time: taskData.remind_time,
       });
     }
 
@@ -691,8 +723,10 @@ bot.on('text', async (ctx) => {
 
       const cleanRule = isValidRecurrenceRule(input.recurrence_rule) ? input.recurrence_rule : null;
       const dueDate = cleanRule ? null : (isValidDate(input.due_date) ? input.due_date : todayStr());
+      const remindTime = isValidTime(input.remind_time) ? input.remind_time : null;
 
-      const scheduleText = cleanRule ? `განმეორებადი (${cleanRule})` : dueDate;
+      const scheduleText =
+        (cleanRule ? `განმეორებადი (${cleanRule})` : dueDate) + (remindTime ? ` — ${remindTime}-ზე` : ' — 08:00-ზე');
 
       awaitingState[chatId] = {
         type: 'ai_confirm',
@@ -702,6 +736,7 @@ bot.on('text', async (ctx) => {
           task_title: input.task_title,
           due_date: dueDate,
           recurrence_rule: cleanRule,
+          remind_time: remindTime,
         },
       };
 
@@ -726,7 +761,7 @@ async function generateRecurringLogs() {
 
   const { data: tasks, error } = await supabase
     .from('tasks')
-    .select('id, recurrence_rule')
+    .select('id, recurrence_rule, remind_time')
     .eq('is_recurring', true)
     .eq('is_archived', false);
 
@@ -750,6 +785,7 @@ async function generateRecurringLogs() {
         task_id: task.id,
         scheduled_date: todayDate,
         status: 'pending',
+        remind_time: task.remind_time || null,
       });
       console.log(`შეიქმნა ახალი log: task ${task.id}, თარიღი ${todayDate}`);
     }
@@ -761,7 +797,7 @@ async function sendReminders() {
 
   const { data: logs, error } = await supabase
     .from('task_logs')
-    .select('id, tasks(title, assigned_to, companies(name), users:assigned_to(telegram_chat_id))')
+    .select('id, remind_time, tasks(title, assigned_to, companies(name), users:assigned_to(telegram_chat_id))')
     .eq('scheduled_date', todayDate)
     .eq('status', 'pending')
     .is('reminder_sent_at', null);
@@ -772,6 +808,8 @@ async function sendReminders() {
   }
 
   for (const log of logs || []) {
+    if (!isInCurrentReminderWindow(log.remind_time)) continue;
+
     const chatId = log.tasks?.users?.telegram_chat_id;
     if (!chatId) continue;
 
@@ -793,9 +831,8 @@ async function sendReminders() {
 }
 
 cron.schedule(
-  '0 8 * * *',
+  '*/5 * * * *',
   async () => {
-    console.log('ვაწყობთ დღევანდელ დავალებებს და ვგზავნით შემახსენებლებს...');
     await generateRecurringLogs();
     await sendReminders();
   },
