@@ -83,9 +83,7 @@ function timeStrToMinutes(t) {
 function isInCurrentReminderWindow(remindTime) {
   // ცარიელი/undefined remind_time ნიშნავს ნაგულისხმევ 08:00-ს
   const target = timeStrToMinutes(remindTime || '08:00');
-  const currentBucket = Math.floor(getCurrentMinutesOfDay() / 5) * 5;
-  const targetBucket = Math.floor(target / 5) * 5;
-  return targetBucket === currentBucket;
+  return target === getCurrentMinutesOfDay();
 }
 
 async function getUserByChatId(chatId) {
@@ -206,6 +204,50 @@ async function findMatchingTaskLog({ company_name, task_keyword, date }) {
   return rows;
 }
 
+async function findBulkMatchingTaskLogs({ date, only_company_name, exclude_company_name, exclude_task_keyword }) {
+  const targetDate = isValidDate(date) ? date : todayStr();
+
+  const { data, error } = await supabase
+    .from('task_logs')
+    .select('id, status, tasks(title, companies(name))')
+    .eq('scheduled_date', targetDate)
+    .neq('status', 'done');
+
+  if (error) {
+    console.error('findBulkMatchingTaskLogs error:', error);
+    return [];
+  }
+
+  let rows = (data || [])
+    .filter((r) => r.tasks)
+    .map((r) => ({
+      logId: r.id,
+      title: r.tasks.title,
+      companyName: r.tasks.companies?.name || 'უცნობი კომპანია',
+    }));
+
+  if (only_company_name) {
+    const lower = only_company_name.toLowerCase();
+    rows = rows.filter(
+      (r) => r.companyName.toLowerCase().includes(lower) || lower.includes(r.companyName.toLowerCase())
+    );
+  }
+
+  if (exclude_company_name) {
+    const lower = exclude_company_name.toLowerCase();
+    rows = rows.filter(
+      (r) => !(r.companyName.toLowerCase().includes(lower) || lower.includes(r.companyName.toLowerCase()))
+    );
+  }
+
+  if (exclude_task_keyword) {
+    const lower = exclude_task_keyword.toLowerCase();
+    rows = rows.filter((r) => !r.title.toLowerCase().includes(lower));
+  }
+
+  return rows;
+}
+
 // ---------- AI (Claude API) — მრავალფუნქციური ინტერპრეტაცია ----------
 
 const AI_TOOLS = [
@@ -258,7 +300,7 @@ const AI_TOOLS = [
   },
   {
     name: 'mark_task_done',
-    description: 'გამოიყენე, როცა მომხმარებელი ამბობს რომ უკვე შეასრულა კონკრეტული დავალება (მაგ. "დავამთავრე X-ის დღგ").',
+    description: 'გამოიყენე, როცა მომხმარებელი ამბობს რომ უკვე შეასრულა ერთი კონკრეტული დავალება (მაგ. "დავამთავრე X-ის დღგ").',
     input_schema: {
       type: 'object',
       properties: {
@@ -268,6 +310,20 @@ const AI_TOOLS = [
         note: { type: 'string', description: 'მოკლე კომენტარი, თუ მომხმარებელმა დაწერა რა გააკეთა.' },
       },
       required: ['company_name', 'task_keyword', 'date', 'note'],
+    },
+  },
+  {
+    name: 'bulk_mark_done',
+    description: 'გამოიყენე, როცა მომხმარებელი ითხოვს რამდენიმე ან ყველა დავალების ერთდროულად დასრულებულად მონიშვნას (მაგ. "ყველა დღევანდელი შესრულებულია გარდა X-ისა", "ყველაფერი დავასრულე").',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date: { type: 'string', description: 'YYYY-MM-DD, ჩვეულებრივ დღევანდელი.' },
+        only_company_name: { type: 'string', description: 'თუ მხოლოდ კონკრეტული კომპანიის დავალებები იგულისხმება. სხვა შემთხვევაში ცარიელი.' },
+        exclude_company_name: { type: 'string', description: 'თუ ერთი კომპანია გამონაკლისია. სხვა შემთხვევაში ცარიელი.' },
+        exclude_task_keyword: { type: 'string', description: 'თუ კონკრეტული დავალება გამონაკლისია საკვანძო სიტყვით. სხვა შემთხვევაში ცარიელი.' },
+      },
+      required: ['date', 'only_company_name', 'exclude_company_name', 'exclude_task_keyword'],
     },
   },
 ];
@@ -290,7 +346,9 @@ async function runAIAgent(text, companies) {
     `(მაგ. სახელი საერთოდ არ ემთხვევა არცერთ არსებულ კომპანიას). ` +
     `მნიშვნელოვანი: სისტემას შეუძლია კონკრეტულ საათზეც შემახსენოს (remind_time ველით, HH:MM ფორმატში, 24-საათიანი). ` +
     `თუ მომხმარებელმა კონკრეტული საათი ახსენა (მაგ. "14:30-ზე"), ჩაწერე ის remind_time ველში. ` +
+    `თუ ნახსენებია ფარდობითი დრო (მაგ. "X-ზე 7 წუთით ადრე"), ზუსტად გამოთვალე საბოლოო საათი (მაგ. 03:00 მინუს 7 წუთი = 02:53) და ჩაწერე შედეგი. ` +
     `თუ საათი არ არის ნახსენები, დატოვე remind_time ცარიელი — მაშინ შემახსენებელი ავტომატურად გაიგზავნება დილის 8 საათზე. ` +
+    `თუ მომხმარებელი ითხოვს რამდენიმე ან ყველა დავალების ერთდროულად დასრულებას (მაგ. "ყველა შესრულებულია გარდა X-ისა"), გამოიყენე bulk_mark_done, არა mark_task_done. ` +
     `თარიღები აუცილებლად გამოთვალე კონკრეტულ YYYY-MM-DD ფორმატში დღევანდელი თარიღიდან გამომდინარე (მაგ. "ხვალ", "15 რიცხვში" და ა.შ.). ` +
     `არასდროს დაწერო სიტყვა "none" ან სხვა placeholder — გამოუყენებელი ველისთვის ყოველთვის ცარიელი სტრიქონი "" გამოიყენე. ` +
     `როცა ჩვეულებრივ ტექსტს პასუხობ (tool-ის გარეშე), დაწერე ბუნებრივი, გამართული, თანამედროვე ქართულით — ` +
@@ -512,6 +570,20 @@ bot.action('ai_confirm_yes', async (ctx) => {
     return ctx.editMessageText('✅ მონიშნულია, როგორც დასრულებული!');
   }
 
+  if (action.kind === 'bulk_mark_done') {
+    const user = await getUserByChatId(chatId);
+    await supabase
+      .from('task_logs')
+      .update({
+        status: 'done',
+        completed_at: new Date().toISOString(),
+        completed_by: user?.id || null,
+        completion_note: action.note || null,
+      })
+      .in('id', action.logIds);
+    return ctx.editMessageText(`✅ ${action.logIds.length} დავალება მონიშნულია, როგორც დასრულებული!`);
+  }
+
   if (action.kind === 'add_task') {
     const taskData = {
       company_id: action.companyId,
@@ -711,6 +783,30 @@ bot.on('text', async (ctx) => {
       );
     }
 
+    // --- რამდენიმე დავალების ერთდროულად დასრულებულად მონიშვნა ---
+    if (toolUse.name === 'bulk_mark_done') {
+      const matches = await findBulkMatchingTaskLogs(input);
+
+      if (matches.length === 0) {
+        return ctx.reply('🤖 ვერ ვიპოვე შესაბამისი აქტიური დავალებები.');
+      }
+
+      const list = matches.map((m) => `• ${m.companyName} — ${m.title}`).join('\n');
+
+      awaitingState[chatId] = {
+        type: 'ai_confirm',
+        action: { kind: 'bulk_mark_done', logIds: matches.map((m) => m.logId), note: null },
+      };
+
+      return ctx.reply(
+        `🤖 დავასრულებულად ვნიშნავ ${matches.length} დავალებას:\n\n${list}\n\nდავადასტურო?`,
+        Markup.inlineKeyboard([
+          Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
+          Markup.button.callback('❌ არა', 'ai_confirm_no'),
+        ])
+      );
+    }
+
     // --- ახალი დავალება ---
     if (toolUse.name === 'add_task' && input.task_title) {
       const company = findCompanyByName(companies, input.company_name);
@@ -831,7 +927,7 @@ async function sendReminders() {
 }
 
 cron.schedule(
-  '*/5 * * * *',
+  '* * * * *',
   async () => {
     await generateRecurringLogs();
     await sendReminders();
