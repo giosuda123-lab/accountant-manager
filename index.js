@@ -100,6 +100,53 @@ async function getActiveCompanies() {
   return data || [];
 }
 
+async function getActiveUsers() {
+  const { data } = await supabase.from('users').select('id, full_name').eq('is_active', true).order('full_name');
+  return data || [];
+}
+
+function findUserByName(users, name) {
+  if (!name) return null;
+  const lower = name.trim().toLowerCase();
+  return (
+    users.find((u) => u.full_name.toLowerCase() === lower) ||
+    users.find((u) => u.full_name.toLowerCase().includes(lower) || lower.includes(u.full_name.toLowerCase())) ||
+    null
+  );
+}
+
+async function findMatchingTasksForDeletion({ company_name, task_keyword }) {
+  const { data, error } = await supabase
+    .from('tasks')
+    .select('id, title, companies(name)')
+    .eq('is_archived', false);
+
+  if (error) {
+    console.error('findMatchingTasksForDeletion error:', error);
+    return [];
+  }
+
+  let rows = (data || []).map((t) => ({
+    taskId: t.id,
+    title: t.title,
+    companyName: t.companies?.name || 'უცნობი კომპანია',
+  }));
+
+  if (company_name) {
+    const lower = company_name.toLowerCase();
+    rows = rows.filter(
+      (r) => r.companyName.toLowerCase().includes(lower) || lower.includes(r.companyName.toLowerCase())
+    );
+  }
+
+  if (task_keyword) {
+    const lower = task_keyword.toLowerCase();
+    rows = rows.filter((r) => r.title.toLowerCase().includes(lower));
+  }
+
+  return rows;
+}
+
 function findCompanyByName(companies, name) {
   if (!name) return null;
   const lower = name.trim().toLowerCase();
@@ -276,8 +323,21 @@ const AI_TOOLS = [
         due_date: { type: 'string', description: 'YYYY-MM-DD ერთჯერადი დავალებისთვის, ან ცარიელი სტრიქონი თუ განმეორებადია.' },
         recurrence_rule: { type: 'string', description: 'monthly_day_N / weekly_დღე(ინგლისურად) / yearly_M_D, ან ცარიელი სტრიქონი თუ ერთჯერადია.' },
         remind_time: { type: 'string', description: 'HH:MM ფორმატში (24-საათიანი), თუ კონკრეტული საათი იყო ნახსენები. სხვა შემთხვევაში ცარიელი სტრიქონი.' },
+        assignee_name: { type: 'string', description: 'გუნდის წევრის სახელი, თუ დავალება კონკრეტულ ადამიანზეა მინიჭებული. სხვა შემთხვევაში ცარიელი სტრიქონი.' },
       },
-      required: ['company_name', 'task_title', 'due_date', 'recurrence_rule', 'remind_time'],
+      required: ['company_name', 'task_title', 'due_date', 'recurrence_rule', 'remind_time', 'assignee_name'],
+    },
+  },
+  {
+    name: 'delete_task',
+    description: 'გამოიყენე, როცა მომხმარებელი ითხოვს კონკრეტული დავალების სრულ წაშლას (არა მხოლოდ დღევანდელი დასრულებას).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        company_name: { type: 'string' },
+        task_keyword: { type: 'string' },
+      },
+      required: ['company_name', 'task_keyword'],
     },
   },
   {
@@ -328,14 +388,16 @@ const AI_TOOLS = [
   },
 ];
 
-async function runAIAgent(text, companies) {
+async function runAIAgent(text, companies, users) {
   const companyList = companies.map((c) => c.name).join(', ') || '(ჯერ არცერთი კომპანია არ არის)';
+  const userList = users.map((u) => u.full_name).join(', ') || '(ჯერ არცერთი გუნდის წევრი არ არის)';
   const today = todayStr();
 
   const systemPrompt =
     `შენ ხარ ბუღალტრის ასისტენტ ბოტის შიდა ლოგიკა, რომელიც ეხმარება მცირე ბუღალტრულ ოფისს კომპანიების და დავალებების მართვაში. ` +
     `დღევანდელი თარიღია ${today} (${TIMEZONE}). ` +
     `არსებული აქტიური კომპანიები: ${companyList}. ` +
+    `გუნდის წევრები: ${userList}. ` +
     `მომხმარებელი წერს ქართულად თავისუფალ ტექსტს, ხანდახან არასრულყოფილი ან არასტანდარტული ფორმულირებით — ` +
     `შენი ამოცანაა გაიგო რეალური განზრახვა და იმოქმედო, არა ზედმეტად დაზუსტება. ` +
     `გამოიყენე შესაბამისი tool, თუ მოთხოვნა ერთ-ერთს ემთხვევა. ` +
@@ -349,6 +411,9 @@ async function runAIAgent(text, companies) {
     `თუ ნახსენებია ფარდობითი დრო (მაგ. "X-ზე 7 წუთით ადრე"), ზუსტად გამოთვალე საბოლოო საათი (მაგ. 03:00 მინუს 7 წუთი = 02:53) და ჩაწერე შედეგი. ` +
     `თუ საათი არ არის ნახსენები, დატოვე remind_time ცარიელი — მაშინ შემახსენებელი ავტომატურად გაიგზავნება დილის 8 საათზე. ` +
     `თუ მომხმარებელი ითხოვს რამდენიმე ან ყველა დავალების ერთდროულად დასრულებას (მაგ. "ყველა შესრულებულია გარდა X-ისა"), გამოიყენე bulk_mark_done, არა mark_task_done. ` +
+    `თუ დავალების შექმნისას ნახსენებია ვისზეც ეს ევალება (მაგ. "ქეთის დავალება" ან "მე თვითონ გავაკეთებ"), ჩაწერე ის სახელი assignee_name ველში, ` +
+    `თუ ვერ ხვდები ვინ, დატოვე ცარიელი — მაშინ დავალება ორივესთვის ჩანს. ` +
+    `თუ მომხმარებელი ითხოვს დავალების სრულ წაშლას (არა უბრალოდ დღევანდელ დასრულებას), გამოიყენე delete_task. ` +
     `თარიღები აუცილებლად გამოთვალე კონკრეტულ YYYY-MM-DD ფორმატში დღევანდელი თარიღიდან გამომდინარე (მაგ. "ხვალ", "15 რიცხვში" და ა.შ.). ` +
     `არასდროს დაწერო სიტყვა "none" ან სხვა placeholder — გამოუყენებელი ველისთვის ყოველთვის ცარიელი სტრიქონი "" გამოიყენე. ` +
     `როცა ჩვეულებრივ ტექსტს პასუხობ (tool-ის გარეშე), დაწერე ბუნებრივი, გამართული, თანამედროვე ქართულით — ` +
@@ -588,6 +653,7 @@ bot.action('ai_confirm_yes', async (ctx) => {
     const taskData = {
       company_id: action.companyId,
       title: action.task_title,
+      assigned_to: action.assignedTo || null,
       is_recurring: !!action.recurrence_rule,
       recurrence_rule: action.recurrence_rule || null,
       due_date: action.recurrence_rule ? null : action.due_date,
@@ -611,6 +677,11 @@ bot.action('ai_confirm_yes', async (ctx) => {
     }
 
     return ctx.editMessageText(`✅ დავალება "${action.task_title}" დაემატა.`);
+  }
+
+  if (action.kind === 'delete_task') {
+    await supabase.from('tasks').delete().eq('id', action.taskId);
+    return ctx.editMessageText(`🗑 დავალება "${action.title}" წაშლილია.`);
   }
 });
 
@@ -709,7 +780,8 @@ bot.on('text', async (ctx) => {
 
   try {
     const companies = await getActiveCompanies();
-    const aiResponse = await runAIAgent(ctx.message.text, companies);
+    const users = await getActiveUsers();
+    const aiResponse = await runAIAgent(ctx.message.text, companies, users);
     const toolUse = aiResponse.content?.find((b) => b.type === 'tool_use');
     const textBlock = aiResponse.content?.find((b) => b.type === 'text');
 
@@ -820,6 +892,7 @@ bot.on('text', async (ctx) => {
       const cleanRule = isValidRecurrenceRule(input.recurrence_rule) ? input.recurrence_rule : null;
       const dueDate = cleanRule ? null : (isValidDate(input.due_date) ? input.due_date : todayStr());
       const remindTime = isValidTime(input.remind_time) ? input.remind_time : null;
+      const assignee = findUserByName(users, input.assignee_name);
 
       const scheduleText =
         (cleanRule ? `განმეორებადი (${cleanRule})` : dueDate) + (remindTime ? ` — ${remindTime}-ზე` : ' — 08:00-ზე');
@@ -833,11 +906,41 @@ bot.on('text', async (ctx) => {
           due_date: dueDate,
           recurrence_rule: cleanRule,
           remind_time: remindTime,
+          assignedTo: assignee?.id || null,
         },
       };
 
       return ctx.reply(
-        `🤖 გავიგე, რომ გსურთ დავალების დამატება:\n\n🏢 ${company.name}\n📋 ${input.task_title}\n📅 ${scheduleText}\n\nდავამატო?`,
+        `🤖 გავიგე, რომ გსურთ დავალების დამატება:\n\n🏢 ${company.name}\n📋 ${input.task_title}\n📅 ${scheduleText}` +
+          (assignee ? `\n👤 ${assignee.full_name}` : '') +
+          `\n\nდავამატო?`,
+        Markup.inlineKeyboard([
+          Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
+          Markup.button.callback('❌ არა', 'ai_confirm_no'),
+        ])
+      );
+    }
+
+    // --- დავალების სრული წაშლა ---
+    if (toolUse.name === 'delete_task') {
+      const matches = await findMatchingTasksForDeletion(input);
+
+      if (matches.length === 0) {
+        return ctx.reply('🤖 ვერ ვიპოვე შესაბამისი დავალება.');
+      }
+      if (matches.length > 1) {
+        const list = matches.map((m) => `• ${m.companyName} — ${m.title}`).join('\n');
+        return ctx.reply(`🤖 რამდენიმე დავალება ემთხვევა, დააკონკრეტეთ რომელი:\n\n${list}`);
+      }
+
+      const match = matches[0];
+      awaitingState[chatId] = {
+        type: 'ai_confirm',
+        action: { kind: 'delete_task', taskId: match.taskId, title: match.title },
+      };
+
+      return ctx.reply(
+        `🤖 დარწმუნებული ხართ, რომ გსურთ სრულად წაშალოთ:\n\n🏢 ${match.companyName}\n📋 ${match.title}\n\n(ეს წაშლის ყველა მასთან დაკავშირებულ ჩანაწერსაც)`,
         Markup.inlineKeyboard([
           Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
           Markup.button.callback('❌ არა', 'ai_confirm_no'),
