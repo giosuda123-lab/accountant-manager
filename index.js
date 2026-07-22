@@ -130,6 +130,47 @@ async function getActiveCompanies() {
   return data || [];
 }
 
+async function getGoogleAccessToken(refreshToken) {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: refreshToken,
+      grant_type: 'refresh_token',
+    }),
+  });
+  const data = await res.json();
+  return data.access_token || null;
+}
+
+async function getCalendarBusyTimes(refreshToken, dateStr) {
+  const accessToken = await getGoogleAccessToken(refreshToken);
+  if (!accessToken) return null;
+
+  // საქართველო მუდმივად UTC+4-ზეა (DST არ იცვლება)
+  const timeMin = `${dateStr}T00:00:00+04:00`;
+  const timeMax = `${dateStr}T23:59:59+04:00`;
+
+  const res = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({ timeMin, timeMax, timeZone: 'Asia/Tbilisi', items: [{ id: 'primary' }] }),
+  });
+
+  const data = await res.json();
+  return data.calendars?.primary?.busy || [];
+}
+
+function formatTimeInTbilisi(isoString) {
+  return new Date(isoString).toLocaleTimeString('ka-GE', {
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: TIMEZONE,
+  });
+}
+
 async function getActiveUsers() {
   const { data } = await supabase.from('users').select('id, full_name').eq('is_active', true).order('full_name');
   return data || [];
@@ -417,6 +458,18 @@ const AI_TOOLS = [
       required: ['date', 'only_company_name', 'exclude_company_name', 'exclude_task_keyword'],
     },
   },
+  {
+    name: 'check_calendar_availability',
+    description: 'გამოიყენე, როცა მომხმარებელი კითხულობს თავის ან გუნდის წევრის განრიგზე Google Calendar-იდან, ან სთხოვს დაგეგმვაში დახმარებას კონკრეტული დღისთვის.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        person_name: { type: 'string', description: 'ვისი კალენდარი გვინდა შევამოწმოთ. თუ ცხადი არ არის, ივარაუდე რომ საკუთარ თავზეა საუბარი — ცარიელი დატოვე.' },
+        date: { type: 'string', description: 'YYYY-MM-DD ფორმატში.' },
+      },
+      required: ['person_name', 'date'],
+    },
+  },
 ];
 
 async function runAIAgent(text, companies, users, history) {
@@ -451,6 +504,7 @@ async function runAIAgent(text, companies, users, history) {
     `თუ მომხმარებელი ითხოვს დავალების სრულ წაშლას (არა უბრალოდ დღევანდელ დასრულებას), გამოიყენე delete_task. ` +
     `თუ რამდენიმე დავალება ემთხვევა და მომხმარებელი ითხოვს ყველას წაშლას, გამოიძახე delete_task confirm_all: true-თი. ` +
     `თუ მომხმარებელი კითხულობს ზოგად რჩევას (მაგ. "როდის ჯობია X დავალება შევასრულო", "დამეხმარე დღის დაგეგმვაში"), ` +
+    `ჯერ გამოიყენე check_calendar_availability (თუ საჭიროა კონკრეტული ადამიანის განრიგის ცოდნა), ` +
     `უპასუხე ჩვეულებრივი ტექსტით (tool-ის გარეშე), გამოიყენე რაც იცი მისი განრიგის შესახებ (წინა query_schedule შედეგებიდან, თუ არსებობს საუბარში) ` +
     `და მიეცი კონკრეტული, პრაქტიკული რჩევა, არა ზოგადი ფრაზები. ` +
     `თარიღები აუცილებლად გამოთვალე კონკრეტულ YYYY-MM-DD ფორმატში დღევანდელი თარიღიდან გამომდინარე (მაგ. "ხვალ", "15 რიცხვში" და ა.შ.). ` +
@@ -923,6 +977,40 @@ bot.on('text', async (ctx) => {
           Markup.button.callback('❌ არა', 'ai_confirm_no'),
         ])
       );
+    }
+
+    // --- Google Calendar-ის განრიგის შემოწმება ---
+    if (toolUse.name === 'check_calendar_availability') {
+      const targetUser = input.person_name ? findUserByName(users, input.person_name) : await getUserByChatId(chatId);
+
+      if (!targetUser) {
+        return ctx.reply(`🤖 ვერ ვიპოვე "${input.person_name}" გუნდის წევრებში.`);
+      }
+
+      const { data: fullUser } = await supabase
+        .from('users')
+        .select('google_refresh_token')
+        .eq('id', targetUser.id)
+        .single();
+
+      if (!fullUser?.google_refresh_token) {
+        return ctx.reply(
+          `🤖 ${targetUser.full_name}-ს ჯერ არ აქვს დაკავშირებული Google Calendar. დააკავშირეთ საიტის "გუნდი" გვერდიდან.`
+        );
+      }
+
+      const dateToCheck = isValidDate(input.date) ? input.date : todayStr();
+      const busy = await getCalendarBusyTimes(fullUser.google_refresh_token, dateToCheck);
+
+      if (busy === null) {
+        return ctx.reply('🤖 კალენდართან დაკავშირება ვერ მოხერხდა, სცადეთ თავიდან.');
+      }
+      if (busy.length === 0) {
+        return ctx.reply(`📅 ${dateToCheck}: ${targetUser.full_name}-ს მთელი დღე თავისუფალი აქვს.`);
+      }
+
+      const busyText = busy.map((b) => `${formatTimeInTbilisi(b.start)}–${formatTimeInTbilisi(b.end)}`).join(', ');
+      return ctx.reply(`📅 ${dateToCheck} — ${targetUser.full_name}-ის დაკავებული პერიოდები: ${busyText}`);
     }
 
     // --- ახალი დავალება ---
