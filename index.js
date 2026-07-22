@@ -163,6 +163,43 @@ async function getCalendarBusyTimes(refreshToken, dateStr) {
   return data.calendars?.primary?.busy || [];
 }
 
+async function getCalendarEvents(refreshToken, dateStr) {
+  const accessToken = await getGoogleAccessToken(refreshToken);
+  if (!accessToken) return null;
+
+  const timeMin = `${dateStr}T00:00:00+04:00`;
+  const timeMax = `${dateStr}T23:59:59+04:00`;
+
+  const params = new URLSearchParams({
+    timeMin,
+    timeMax,
+    singleEvents: 'true',
+    orderBy: 'startTime',
+    timeZone: 'Asia/Tbilisi',
+  });
+
+  const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  const data = await res.json();
+  return data.items || [];
+}
+
+function formatEventsList(events) {
+  if (events.length === 0) return null;
+
+  return events
+    .map((e) => {
+      const title = e.summary || '(უსათაურო)';
+      if (e.start?.date) return `მთელი დღე — ${title}`;
+      const start = formatTimeInTbilisi(e.start.dateTime);
+      const end = formatTimeInTbilisi(e.end.dateTime);
+      return `${start}–${end} — ${title}`;
+    })
+    .join('\n');
+}
+
 function formatTimeInTbilisi(isoString) {
   return new Date(isoString).toLocaleTimeString('ka-GE', {
     hour: '2-digit',
@@ -460,7 +497,7 @@ const AI_TOOLS = [
   },
   {
     name: 'check_calendar_availability',
-    description: 'გამოიყენე, როცა მომხმარებელი კითხულობს თავის ან გუნდის წევრის განრიგზე Google Calendar-იდან, ან სთხოვს დაგეგმვაში დახმარებას კონკრეტული დღისთვის.',
+    description: 'გამოიყენე, როცა მომხმარებელი კითხულობს თავის ან გუნდის წევრის განრიგზე Google Calendar-იდან (რა აქვს დაკავებული, რა ღონისძიებებია) ან სთხოვს დაგეგმვაში დახმარებას კონკრეტული დღისთვის.',
     input_schema: {
       type: 'object',
       properties: {
@@ -1000,17 +1037,17 @@ bot.on('text', async (ctx) => {
       }
 
       const dateToCheck = isValidDate(input.date) ? input.date : todayStr();
-      const busy = await getCalendarBusyTimes(fullUser.google_refresh_token, dateToCheck);
+      const events = await getCalendarEvents(fullUser.google_refresh_token, dateToCheck);
 
-      if (busy === null) {
+      if (events === null) {
         return ctx.reply('🤖 კალენდართან დაკავშირება ვერ მოხერხდა, სცადეთ თავიდან.');
       }
-      if (busy.length === 0) {
+      if (events.length === 0) {
         return ctx.reply(`📅 ${dateToCheck}: ${targetUser.full_name}-ს მთელი დღე თავისუფალი აქვს.`);
       }
 
-      const busyText = busy.map((b) => `${formatTimeInTbilisi(b.start)}–${formatTimeInTbilisi(b.end)}`).join(', ');
-      return ctx.reply(`📅 ${dateToCheck} — ${targetUser.full_name}-ის დაკავებული პერიოდები: ${busyText}`);
+      const eventsList = formatEventsList(events);
+      return ctx.reply(`📅 ${dateToCheck} — ${targetUser.full_name}-ის განრიგი:\n\n${eventsList}`);
     }
 
     // --- ახალი დავალება ---
