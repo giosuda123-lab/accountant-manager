@@ -18,6 +18,20 @@ if (!BOT_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 const bot = new Telegraf(BOT_TOKEN);
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
+// გამჭვირვალედ ვინახავთ ბოტის ყველა ტექსტურ პასუხს სასაუბრო მეხსიერებისთვის,
+// ისე რომ ცალკეული ctx.reply გამოძახებების შეცვლა არ დაგვჭირდეს.
+bot.use(async (ctx, next) => {
+  const originalReply = ctx.reply.bind(ctx);
+  ctx.reply = async (text, extra) => {
+    const sent = await originalReply(text, extra);
+    if (ctx.chat?.id && typeof text === 'string') {
+      saveMessage(ctx.chat.id, 'assistant', text).catch((e) => console.error('saveMessage error:', e.message));
+    }
+    return sent;
+  };
+  await next();
+});
+
 const awaitingState = {};
 
 // ---------- დამხმარე ფუნქციები ----------
@@ -93,6 +107,22 @@ async function getUserByChatId(chatId) {
     .eq('telegram_chat_id', String(chatId))
     .single();
   return data;
+}
+
+async function saveMessage(chatId, role, content) {
+  if (!content) return;
+  await supabase.from('chat_messages').insert({ telegram_chat_id: String(chatId), role, content });
+}
+
+async function loadRecentMessages(chatId, limit = 20) {
+  const { data } = await supabase
+    .from('chat_messages')
+    .select('role, content, created_at')
+    .eq('telegram_chat_id', String(chatId))
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  return (data || []).reverse().map((m) => ({ role: m.role, content: m.content }));
 }
 
 async function getActiveCompanies() {
@@ -336,8 +366,9 @@ const AI_TOOLS = [
       properties: {
         company_name: { type: 'string' },
         task_keyword: { type: 'string' },
+        confirm_all: { type: 'boolean', description: 'true, თუ მომხმარებელმა უკვე დაადასტურა რომ ყველა ემთხვევადი დავალება წაშალო.' },
       },
-      required: ['company_name', 'task_keyword'],
+      required: ['company_name', 'task_keyword', 'confirm_all'],
     },
   },
   {
@@ -388,7 +419,7 @@ const AI_TOOLS = [
   },
 ];
 
-async function runAIAgent(text, companies, users) {
+async function runAIAgent(text, companies, users, history) {
   const companyList = companies.map((c) => c.name).join(', ') || '(ჯერ არცერთი კომპანია არ არის)';
   const userList = users.map((u) => u.full_name).join(', ') || '(ჯერ არცერთი გუნდის წევრი არ არის)';
   const today = todayStr();
@@ -398,14 +429,18 @@ async function runAIAgent(text, companies, users) {
     `დღევანდელი თარიღია ${today} (${TIMEZONE}). ` +
     `არსებული აქტიური კომპანიები: ${companyList}. ` +
     `გუნდის წევრები: ${userList}. ` +
+    `გახსოვდეს წინა შეტყობინებები ამ საუბარში (თუ თანდართულია) — თუ მომხმარებელი პასუხობს "ორივე", "ეს", "წინა", ` +
+    `"ყველა ეს" და მისთანები, გაიგე ეს წინა შეტყობინებების კონტექსტიდან და მოქმედი ველები (მაგ. company_name, task_keyword) ` +
+    `აღადგინე იმ კონტექსტიდან, ხელახლა ნუ ჰკითხავ. ` +
     `მომხმარებელი წერს ქართულად თავისუფალ ტექსტს, ხანდახან არასრულყოფილი ან არასტანდარტული ფორმულირებით — ` +
     `შენი ამოცანაა გაიგო რეალური განზრახვა და იმოქმედო, არა ზედმეტად დაზუსტება. ` +
     `გამოიყენე შესაბამისი tool, თუ მოთხოვნა ერთ-ერთს ემთხვევა. ` +
     `თუ რაიმე დეტალი (მაგ. თარიღი) ცალსახად არ არის ნახსენები, გამოიყენე ყველაზე გონივრული ვარაუდი ` +
     `(მაგ. თუ თარიღი საერთოდ არ არის ნახსენები, ივარაუდე დღევანდელი) და მაინც გამოიძახე tool — ` +
-    `არ იკითხო დამაზუსტებელი კითხვა, თუ ინფორმაცია გონივრულად ამოსაცნობია კონტექსტიდან. ` +
-    `დამაზუსტებელი კითხვა დასვი მხოლოდ იმ შემთხვევაში, თუ ნამდვილად ორაზროვანია რომელი კომპანია იგულისხმება ` +
-    `(მაგ. სახელი საერთოდ არ ემთხვევა არცერთ არსებულ კომპანიას). ` +
+    `არ იკითხო დამაზუსტებელი კითხვა, თუ ინფორმაცია გონივრულად ამოსაცნობია კონტექსტიდან (მათ შორის წინა შეტყობინებებიდან). ` +
+    `დამაზუსტებელი კითხვა დასვი მხოლოდ იმ შემთხვევაში, თუ ნამდვილად ორაზროვანია და წინა კონტექსტიც ვერ გვეხმარება. ` +
+    `თუ მომხმარებელი წინა დამაზუსტებელ კითხვას პასუხობს დადასტურებით (მაგ. "ორივე", "ყველა", "დიახ ორივე წაშალე"), ` +
+    `გამოიძახე შესაბამისი bulk_* ან confirm_all: true პარამეტრიანი ვერსია tool-ისა, კონკრეტული task_keyword-ით რომელიც წინა შეტყობინებაში იხსენიება. ` +
     `მნიშვნელოვანი: სისტემას შეუძლია კონკრეტულ საათზეც შემახსენოს (remind_time ველით, HH:MM ფორმატში, 24-საათიანი). ` +
     `თუ მომხმარებელმა კონკრეტული საათი ახსენა (მაგ. "14:30-ზე"), ჩაწერე ის remind_time ველში. ` +
     `თუ ნახსენებია ფარდობითი დრო (მაგ. "X-ზე 7 წუთით ადრე"), ზუსტად გამოთვალე საბოლოო საათი (მაგ. 03:00 მინუს 7 წუთი = 02:53) და ჩაწერე შედეგი. ` +
@@ -414,6 +449,10 @@ async function runAIAgent(text, companies, users) {
     `თუ დავალების შექმნისას ნახსენებია ვისზეც ეს ევალება (მაგ. "ქეთის დავალება" ან "მე თვითონ გავაკეთებ"), ჩაწერე ის სახელი assignee_name ველში, ` +
     `თუ ვერ ხვდები ვინ, დატოვე ცარიელი — მაშინ დავალება ორივესთვის ჩანს. ` +
     `თუ მომხმარებელი ითხოვს დავალების სრულ წაშლას (არა უბრალოდ დღევანდელ დასრულებას), გამოიყენე delete_task. ` +
+    `თუ რამდენიმე დავალება ემთხვევა და მომხმარებელი ითხოვს ყველას წაშლას, გამოიძახე delete_task confirm_all: true-თი. ` +
+    `თუ მომხმარებელი კითხულობს ზოგად რჩევას (მაგ. "როდის ჯობია X დავალება შევასრულო", "დამეხმარე დღის დაგეგმვაში"), ` +
+    `უპასუხე ჩვეულებრივი ტექსტით (tool-ის გარეშე), გამოიყენე რაც იცი მისი განრიგის შესახებ (წინა query_schedule შედეგებიდან, თუ არსებობს საუბარში) ` +
+    `და მიეცი კონკრეტული, პრაქტიკული რჩევა, არა ზოგადი ფრაზები. ` +
     `თარიღები აუცილებლად გამოთვალე კონკრეტულ YYYY-MM-DD ფორმატში დღევანდელი თარიღიდან გამომდინარე (მაგ. "ხვალ", "15 რიცხვში" და ა.შ.). ` +
     `არასდროს დაწერო სიტყვა "none" ან სხვა placeholder — გამოუყენებელი ველისთვის ყოველთვის ცარიელი სტრიქონი "" გამოიყენე. ` +
     `როცა ჩვეულებრივ ტექსტს პასუხობ (tool-ის გარეშე), დაწერე ბუნებრივი, გამართული, თანამედროვე ქართულით — ` +
@@ -428,9 +467,9 @@ async function runAIAgent(text, companies, users) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-5',
-      max_tokens: 500,
+      max_tokens: 600,
       system: systemPrompt,
-      messages: [{ role: 'user', content: text }],
+      messages: [...(history || []), { role: 'user', content: text }],
       tools: AI_TOOLS,
       tool_choice: { type: 'auto' },
     }),
@@ -683,6 +722,11 @@ bot.action('ai_confirm_yes', async (ctx) => {
     await supabase.from('tasks').delete().eq('id', action.taskId);
     return ctx.editMessageText(`🗑 დავალება "${action.title}" წაშლილია.`);
   }
+
+  if (action.kind === 'bulk_delete_task') {
+    await supabase.from('tasks').delete().in('id', action.taskIds);
+    return ctx.editMessageText(`🗑 ${action.taskIds.length} დავალება წაშლილია.`);
+  }
 });
 
 bot.action('ai_confirm_no', async (ctx) => {
@@ -781,7 +825,9 @@ bot.on('text', async (ctx) => {
   try {
     const companies = await getActiveCompanies();
     const users = await getActiveUsers();
-    const aiResponse = await runAIAgent(ctx.message.text, companies, users);
+    const history = await loadRecentMessages(chatId, 20);
+    await saveMessage(chatId, 'user', ctx.message.text);
+    const aiResponse = await runAIAgent(ctx.message.text, companies, users, history);
     const toolUse = aiResponse.content?.find((b) => b.type === 'tool_use');
     const textBlock = aiResponse.content?.find((b) => b.type === 'text');
 
@@ -928,9 +974,25 @@ bot.on('text', async (ctx) => {
       if (matches.length === 0) {
         return ctx.reply('🤖 ვერ ვიპოვე შესაბამისი დავალება.');
       }
-      if (matches.length > 1) {
+
+      if (matches.length > 1 && !input.confirm_all) {
         const list = matches.map((m) => `• ${m.companyName} — ${m.title}`).join('\n');
-        return ctx.reply(`🤖 რამდენიმე დავალება ემთხვევა, დააკონკრეტეთ რომელი:\n\n${list}`);
+        return ctx.reply(`🤖 რამდენიმე დავალება ემთხვევა, დააკონკრეტეთ რომელი (ან დაწერეთ "ორივე"/"ყველა"):\n\n${list}`);
+      }
+
+      if (matches.length > 1 && input.confirm_all) {
+        const list = matches.map((m) => `• ${m.companyName} — ${m.title}`).join('\n');
+        awaitingState[chatId] = {
+          type: 'ai_confirm',
+          action: { kind: 'bulk_delete_task', taskIds: matches.map((m) => m.taskId) },
+        };
+        return ctx.reply(
+          `🤖 ${matches.length} დავალებას სრულად ვშლი:\n\n${list}\n\nდავადასტურო?`,
+          Markup.inlineKeyboard([
+            Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
+            Markup.button.callback('❌ არა', 'ai_confirm_no'),
+          ])
+        );
       }
 
       const match = matches[0];
