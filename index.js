@@ -460,11 +460,14 @@ const AI_TOOLS = [
   },
   {
     name: 'delete_company',
-    description: 'გამოიყენე არსებული კომპანიის წასაშლელად.',
+    description: 'გამოიყენე ერთი ან რამდენიმე არსებული კომპანიის წასაშლელად.',
     input_schema: {
       type: 'object',
-      properties: { company_name: { type: 'string' } },
-      required: ['company_name'],
+      properties: {
+        company_names: { type: 'string', description: 'კომპანიის სახელი, ან რამდენიმე სახელი მძიმით გამოყოფილი, თუ ერთდროულად რამდენიმეს წაშლა სურთ.' },
+        confirm_all: { type: 'boolean', description: 'true, თუ მომხმარებელმა უკვე დაადასტურა ყველა ჩამოთვლილის წაშლა.' },
+      },
+      required: ['company_names', 'confirm_all'],
     },
   },
   {
@@ -540,6 +543,8 @@ async function runAIAgent(text, companies, users, history) {
     `თუ ვერ ხვდები ვინ, დატოვე ცარიელი — მაშინ დავალება ორივესთვის ჩანს. ` +
     `თუ მომხმარებელი ითხოვს დავალების სრულ წაშლას (არა უბრალოდ დღევანდელ დასრულებას), გამოიყენე delete_task. ` +
     `თუ რამდენიმე დავალება ემთხვევა და მომხმარებელი ითხოვს ყველას წაშლას, გამოიძახე delete_task confirm_all: true-თი. ` +
+    `თუ მომხმარებელი ითხოვს ერთი ან რამდენიმე კომპანიის წაშლას, გამოიყენე delete_company — company_names ველში ` +
+    `ჩაწერე სახელი(ები), თუ რამდენიმეა, მძიმით გამოყოფილი (მაგ. "X, Y, Z"), confirm_all: true თუ უკვე დაადასტურეს ყველას წაშლა. ` +
     `თუ მომხმარებელი კითხულობს ზოგად რჩევას (მაგ. "როდის ჯობია X დავალება შევასრულო", "დამეხმარე დღის დაგეგმვაში"), ` +
     `ჯერ გამოიყენე check_calendar_availability (თუ საჭიროა კონკრეტული ადამიანის განრიგის ცოდნა), ` +
     `უპასუხე ჩვეულებრივი ტექსტით (tool-ის გარეშე), გამოიყენე რაც იცი მისი განრიგის შესახებ (წინა query_schedule შედეგებიდან, თუ არსებობს საუბარში) ` +
@@ -746,9 +751,10 @@ bot.action('ai_confirm_yes', async (ctx) => {
   }
 
   if (action.kind === 'delete_company') {
-    await supabase.from('companies').update({ is_active: false }).eq('id', action.companyId);
-    await supabase.from('tasks').update({ is_archived: true }).eq('company_id', action.companyId);
-    return ctx.editMessageText(`🗑 კომპანია "${action.companyName}" წაშლილია.`);
+    await supabase.from('companies').update({ is_active: false }).in('id', action.companyIds);
+    await supabase.from('tasks').update({ is_archived: true }).in('company_id', action.companyIds);
+    const names = action.companyNames.join(', ');
+    return ctx.editMessageText(`🗑 კომპანია(ები) წაშლილია: ${names}`);
   }
 
   if (action.kind === 'mark_task_done') {
@@ -947,18 +953,46 @@ bot.on('text', async (ctx) => {
       );
     }
 
-    // --- კომპანიის წაშლა ---
-    if (toolUse.name === 'delete_company' && input.company_name) {
-      const company = findCompanyByName(companies, input.company_name);
-      if (!company) {
-        return ctx.reply(`🤖 ვერ ვიპოვე კომპანია "${input.company_name}".`);
+    // --- კომპანიის წაშლა (ერთი ან რამდენიმე) ---
+    if (toolUse.name === 'delete_company' && input.company_names) {
+      const requestedNames = input.company_names.split(',').map((n) => n.trim()).filter(Boolean);
+      const matched = requestedNames
+        .map((name) => findCompanyByName(companies, name))
+        .filter(Boolean);
+
+      // დუპლიკატების მოცილება
+      const uniqueMatched = Array.from(new Map(matched.map((c) => [c.id, c])).values());
+
+      if (uniqueMatched.length === 0) {
+        return ctx.reply(`🤖 ვერ ვიპოვე მითითებული კომპანია(ები).`);
       }
+
+      const list = uniqueMatched.map((c) => `• ${c.name}`).join('\n');
+
+      if (uniqueMatched.length === 1) {
+        awaitingState[chatId] = {
+          type: 'ai_confirm',
+          action: { kind: 'delete_company', companyIds: [uniqueMatched[0].id], companyNames: [uniqueMatched[0].name] },
+        };
+        return ctx.reply(
+          `🤖 დარწმუნებული ხართ, რომ გსურთ წაშალოთ "${uniqueMatched[0].name}"? ეს დამალავს კომპანიას და მის ყველა დავალებას.`,
+          Markup.inlineKeyboard([
+            Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
+            Markup.button.callback('❌ არა', 'ai_confirm_no'),
+          ])
+        );
+      }
+
+      if (!input.confirm_all) {
+        return ctx.reply(`🤖 შემდეგი კომპანიები მოიძებნა, დაადასტურეთ რომ ყველა გსურთ წაშალოთ:\n\n${list}`);
+      }
+
       awaitingState[chatId] = {
         type: 'ai_confirm',
-        action: { kind: 'delete_company', companyId: company.id, companyName: company.name },
+        action: { kind: 'delete_company', companyIds: uniqueMatched.map((c) => c.id), companyNames: uniqueMatched.map((c) => c.name) },
       };
       return ctx.reply(
-        `🤖 დარწმუნებული ხართ, რომ გსურთ წაშალოთ "${company.name}"? ეს დამალავს კომპანიას და მის ყველა დავალებას.`,
+        `🤖 ${uniqueMatched.length} კომპანიას სრულად ვშლი:\n\n${list}\n\nდავადასტურო?`,
         Markup.inlineKeyboard([
           Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
           Markup.button.callback('❌ არა', 'ai_confirm_no'),
@@ -1231,11 +1265,107 @@ async function sendReminders() {
   }
 }
 
+function resolveTargetChatIds(assignedTo, allUsers) {
+  if (assignedTo) {
+    const assignedUser = (allUsers || []).find((u) => u.id === assignedTo);
+    if (assignedUser?.telegram_chat_id) return [assignedUser.telegram_chat_id];
+  }
+  return (allUsers || []).map((u) => u.telegram_chat_id);
+}
+
+async function sendEveningNudges() {
+  const todayDate = todayStr();
+
+  const { data: logs, error } = await supabase
+    .from('task_logs')
+    .select('id, evening_nudge_date, tasks(title, assigned_to, companies(name))')
+    .eq('scheduled_date', todayDate)
+    .eq('status', 'pending');
+
+  if (error) {
+    console.error('sendEveningNudges error:', error);
+    return;
+  }
+
+  const { data: allUsers } = await supabase
+    .from('users')
+    .select('id, telegram_chat_id')
+    .not('telegram_chat_id', 'is', null);
+
+  for (const log of logs || []) {
+    if (log.evening_nudge_date === todayDate) continue;
+
+    const companyName = log.tasks?.companies?.name || 'უცნობი კომპანია';
+    const title = log.tasks?.title || '';
+    const targetChatIds = resolveTargetChatIds(log.tasks?.assigned_to, allUsers);
+
+    for (const chatId of targetChatIds) {
+      try {
+        await bot.telegram.sendMessage(
+          chatId,
+          `🌙 დღეს ვერ დაასრულეთ:\n\n🏢 ${companyName}\n📋 ${title}\n\nხვალაც შეგახსენებთ, სანამ არ დაასრულებთ.`,
+          Markup.inlineKeyboard([Markup.button.callback('✅ დასრულებულია', `done_${log.id}`)])
+        );
+      } catch (e) {
+        console.error(`ვერ გაიგზავნა საღამოს შეხსენება chat_id ${chatId}-ზე:`, e.message);
+      }
+    }
+
+    await supabase.from('task_logs').update({ evening_nudge_date: todayDate }).eq('id', log.id);
+  }
+}
+
+async function sendMorningOverdueNudges() {
+  const todayDate = todayStr();
+
+  const { data: logs, error } = await supabase
+    .from('task_logs')
+    .select('id, scheduled_date, morning_nudge_date, tasks(title, assigned_to, companies(name))')
+    .lt('scheduled_date', todayDate)
+    .eq('status', 'pending');
+
+  if (error) {
+    console.error('sendMorningOverdueNudges error:', error);
+    return;
+  }
+
+  const { data: allUsers } = await supabase
+    .from('users')
+    .select('id, telegram_chat_id')
+    .not('telegram_chat_id', 'is', null);
+
+  for (const log of logs || []) {
+    if (log.morning_nudge_date === todayDate) continue;
+
+    const companyName = log.tasks?.companies?.name || 'უცნობი კომპანია';
+    const title = log.tasks?.title || '';
+    const targetChatIds = resolveTargetChatIds(log.tasks?.assigned_to, allUsers);
+
+    for (const chatId of targetChatIds) {
+      try {
+        await bot.telegram.sendMessage(
+          chatId,
+          `🔴 ვადაგადაცილებული (${log.scheduled_date}-დან):\n\n🏢 ${companyName}\n📋 ${title}`,
+          Markup.inlineKeyboard([Markup.button.callback('✅ დასრულებულია', `done_${log.id}`)])
+        );
+      } catch (e) {
+        console.error(`ვერ გაიგზავნა დილის შეხსენება chat_id ${chatId}-ზე:`, e.message);
+      }
+    }
+
+    await supabase.from('task_logs').update({ morning_nudge_date: todayDate }).eq('id', log.id);
+  }
+}
+
 cron.schedule(
   '* * * * *',
   async () => {
     await generateRecurringLogs();
     await sendReminders();
+
+    const currentMinutes = getCurrentMinutesOfDay();
+    if (currentMinutes === timeStrToMinutes('20:00')) await sendEveningNudges();
+    if (currentMinutes === timeStrToMinutes('08:00')) await sendMorningOverdueNudges();
   },
   { timezone: TIMEZONE }
 );
