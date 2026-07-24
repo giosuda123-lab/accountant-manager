@@ -454,8 +454,15 @@ const AI_TOOLS = [
     description: 'გამოიყენე ახალი კომპანიის დასამატებლად.',
     input_schema: {
       type: 'object',
-      properties: { company_name: { type: 'string' } },
-      required: ['company_name'],
+      properties: {
+        company_name: { type: 'string' },
+        tier: {
+          type: 'string',
+          enum: ['llc', 'small_business', 'individual', ''],
+          description: 'კომპანიის იურიდიული ფორმა: llc (შპს), small_business (მცირე ბიზნესი), individual (ინდ. მეწარმე). თუ ცხადი არ არის, დატოვე ცარიელი.',
+        },
+      },
+      required: ['company_name', 'tier'],
     },
   },
   {
@@ -544,6 +551,9 @@ async function runAIAgent(text, companies, users, history) {
     `თუ მომხმარებელი ითხოვს დავალების სრულ წაშლას (არა უბრალოდ დღევანდელ დასრულებას), გამოიყენე delete_task. ` +
     `თუ რამდენიმე დავალება ემთხვევა და მომხმარებელი ითხოვს ყველას წაშლას, გამოიძახე delete_task confirm_all: true-თი. ` +
     `თუ მომხმარებელი ითხოვს ერთი ან რამდენიმე კომპანიის წაშლას, გამოიყენე delete_company — company_names ველში ` +
+    `ახალი კომპანიის დამატებისას, თუ ტექსტიდან ცხადია იურიდიული ფორმა (მაგ. სახელში წერია "შპს" ან ნახსენებია "ინდ. მეწარმეა"), ` +
+    `ჩაწერე შესაბამისი tier მნიშვნელობა. თუ საერთოდ არაფერია ნახსენები, დატოვე tier ცარიელი — ამ შემთხვევაში ` +
+    `ნაგულისხმევად "შპს" დაემატება, რაც მოგვიანებით საიტიდან შეიცვლება. ` +
     `ჩაწერე სახელი(ები), თუ რამდენიმეა, მძიმით გამოყოფილი (მაგ. "X, Y, Z"), confirm_all: true თუ უკვე დაადასტურეს ყველას წაშლა. ` +
     `თუ მომხმარებელი კითხულობს ზოგად რჩევას (მაგ. "როდის ჯობია X დავალება შევასრულო", "დამეხმარე დღის დაგეგმვაში"), ` +
     `ჯერ გამოიყენე check_calendar_availability (თუ საჭიროა კონკრეტული ადამიანის განრიგის ცოდნა), ` +
@@ -746,7 +756,7 @@ bot.action('ai_confirm_yes', async (ctx) => {
   delete awaitingState[chatId];
 
   if (action.kind === 'add_company') {
-    await supabase.from('companies').insert({ name: action.company_name });
+    await supabase.from('companies').insert({ name: action.company_name, tier: action.tier || 'llc' });
     return ctx.editMessageText(`✅ კომპანია "${action.company_name}" დაემატა.`);
   }
 
@@ -943,9 +953,16 @@ bot.on('text', async (ctx) => {
 
     // --- ახალი კომპანია ---
     if (toolUse.name === 'add_company' && input.company_name) {
-      awaitingState[chatId] = { type: 'ai_confirm', action: { kind: 'add_company', company_name: input.company_name } };
+      const validTiers = ['llc', 'small_business', 'individual'];
+      const tier = validTiers.includes(input.tier) ? input.tier : 'llc';
+      const tierLabel = { llc: 'შპს', small_business: 'მცირე ბიზნესი', individual: 'ინდ. მეწარმე' }[tier];
+
+      awaitingState[chatId] = {
+        type: 'ai_confirm',
+        action: { kind: 'add_company', company_name: input.company_name, tier },
+      };
       return ctx.reply(
-        `🤖 გავიგე, რომ გსურთ ახალი კომპანიის დამატება:\n\n🏢 ${input.company_name}\n\nდავამატო?`,
+        `🤖 გავიგე, რომ გსურთ ახალი კომპანიის დამატება:\n\n🏢 ${input.company_name}\n📋 ${tierLabel}${!validTiers.includes(input.tier) ? ' (ნაგულისხმევი — მოგვიანებით შეგიძლიათ შეცვალოთ საიტზე)' : ''}\n\nდავამატო?`,
         Markup.inlineKeyboard([
           Markup.button.callback('✅ დიახ', 'ai_confirm_yes'),
           Markup.button.callback('❌ არა', 'ai_confirm_no'),
