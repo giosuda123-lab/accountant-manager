@@ -594,6 +594,22 @@ bot.start((ctx) => {
   );
 });
 
+bot.command('login', async (ctx) => {
+  const user = await getUserByChatId(ctx.chat.id);
+  if (!user) {
+    return ctx.reply('თქვენ ჯერ არ ხართ დარეგისტრირებული სისტემაში. მიმართეთ ადმინისტრატორს.');
+  }
+
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+  await supabase.from('users').update({ login_code: code, login_code_expires_at: expiresAt }).eq('id', user.id);
+
+  ctx.reply(
+    `🔑 თქვენი ერთჯერადი კოდი საიტზე შესასვლელად:\n\n${code}\n\nმოქმედია 5 წუთის განმავლობაში. შეიყვანეთ საიტის login გვერდზე.`
+  );
+});
+
 bot.command('help', (ctx) => {
   ctx.reply(
     'ხელმისაწვდომი ბრძანებები:\n\n' +
